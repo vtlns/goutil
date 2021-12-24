@@ -1,0 +1,15 @@
+language: go
+go:
+  - 1.12.x
+
+env:
+  global:
+    - GO111MODULE=on
+
+script:
+    - make test
+
+
+notifications:
+  on_success: never
+  on_failure: always
