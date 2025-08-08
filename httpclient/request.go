@@ -1,4 +1,4 @@
-// Copyright 2018 ouqiang authors
+// Copyright 2018 vtlns authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License"): you may
 // not use this file except in compliance with the License. You may obtain
@@ -27,10 +27,24 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 )
+
+var (
+	metricValue *atomic.Value
+)
+
+// EnableMetric 启用metrics
+func EnableMetric(m *Metric) {
+	if m == nil {
+		return
+	}
+	metricValue = &atomic.Value{}
+	metricValue.Store(m)
+}
 
 const (
 	defaultTimeout             = 20 * time.Second
@@ -71,7 +85,7 @@ type options struct {
 	clientTrace         *httptrace.ClientTrace
 }
 
-// DNSResolver DNS解析
+// DNSResolverFunc DNS解析
 type DNSResolverFunc func(host string) (ip string, err error)
 
 type DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -205,6 +219,10 @@ func (req *Request) init() {
 	if req.opts.connectTimeout <= 0 {
 		req.opts.connectTimeout = defaultConnectTimeout
 	}
+	if req.opts.timeout <= 0 {
+		req.opts.timeout = defaultTimeout
+	}
+
 	if req.opts.maxIdleConnsPerHost <= 0 {
 		req.opts.maxIdleConnsPerHost = defaultMaxIdleConnsPerHost
 	}
@@ -231,7 +249,9 @@ func (req *Request) init() {
 	}
 
 	if req.opts.client == nil {
-		req.opts.client = &http.Client{}
+		req.opts.client = &http.Client{
+			Timeout: req.opts.timeout,
+		}
 	}
 	if req.opts.dnsResolver != nil {
 		trans.DialContext = req.dialContext()
@@ -241,9 +261,6 @@ func (req *Request) init() {
 	}
 	if req.opts.client.Transport == nil {
 		req.opts.client.Transport = trans
-	}
-	if req.opts.timeout == 0 {
-		req.opts.client.Timeout = defaultTimeout
 	}
 	if req.opts.shouldRetryFunc == nil {
 		req.opts.shouldRetryFunc = req.shouldRetry
@@ -257,23 +274,23 @@ func (req *Request) init() {
 func (req *Request) Get(url string, params url.Values, header http.Header) (*Response, error) {
 	url = req.makeURLWithParams(url, params)
 
-	return req.do(http.MethodGet, url, nil, header)
+	return req.Do(context.Background(), http.MethodGet, url, nil, header)
 }
 
 // Post 普通post请求
 func (req *Request) Post(url string, data interface{}, header http.Header) (*Response, error) {
 
-	return req.do(http.MethodPost, url, data, header)
+	return req.Do(context.Background(), http.MethodPost, url, data, header)
 }
 
 // Put Put请求
 func (req *Request) Put(url string, data interface{}, header http.Header) (*Response, error) {
-	return req.do(http.MethodPut, url, data, header)
+	return req.Do(context.Background(), http.MethodPut, url, data, header)
 }
 
 // Delete Delete请求
 func (req *Request) Delete(url string, data interface{}, header http.Header) (*Response, error) {
-	return req.do(http.MethodDelete, url, data, header)
+	return req.Do(context.Background(), http.MethodDelete, url, data, header)
 }
 
 // PostJSON 发送json body
@@ -294,7 +311,7 @@ func (req *Request) PostJSON(url string, data interface{}, header http.Header) (
 		}
 	}
 
-	return req.do(http.MethodPost, url, body, header)
+	return req.Do(context.Background(), http.MethodPost, url, body, header)
 }
 
 // PostProtoBuf 发送protoBuf body
@@ -308,7 +325,7 @@ func (req *Request) PostProtoBuf(url string, v proto.Message, header http.Header
 		return nil, err
 	}
 
-	return req.do(http.MethodPost, url, body, header)
+	return req.Do(context.Background(), http.MethodPost, url, body, header)
 }
 
 // UploadFile 上传文件
@@ -346,7 +363,7 @@ func (req *Request) UploadFile(url string, reader io.Reader, filename string, he
 	return resp, respErr
 }
 
-func (req *Request) do(method string, url string, data interface{}, header http.Header) (*Response, error) {
+func (req *Request) Do(ctx context.Context, method string, url string, data interface{}, header http.Header) (*Response, error) {
 	execTimes := 1
 	retryInterval := 300 * time.Millisecond
 	if req.opts.retryTimes > 0 {
@@ -355,16 +372,29 @@ func (req *Request) do(method string, url string, data interface{}, header http.
 	var targetReq *http.Request
 	var resp *http.Response
 	var err error
+	var startTime time.Time
+	var metric *Metric
+	if metricValue != nil {
+		metric, _ = metricValue.Load().(*Metric)
+	}
+
 	for i := 0; i < execTimes; {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		targetReq, err = req.build(method, url, data, header)
+		targetReq, err = req.build(ctx, method, url, data, header)
 		if err != nil {
 			return nil, err
 		}
 		req.beforeRequest(targetReq)
+		if metric != nil {
+			startTime = time.Now()
+		}
 		resp, err = req.opts.client.Do(targetReq)
+		if metric != nil {
+			metric.Count(targetReq.URL, err)
+			metric.Latency(targetReq.URL, time.Since(startTime))
+		}
 		req.afterResponse(targetReq, resp, err)
 		if req.opts.retryTimes > 0 && !req.opts.shouldRetryFunc(targetReq, resp, err) {
 			break
@@ -380,9 +410,9 @@ func (req *Request) do(method string, url string, data interface{}, header http.
 }
 
 // 构造http.Request
-func (req *Request) build(method string, url string, data interface{}, header http.Header) (*http.Request, error) {
+func (req *Request) build(ctx context.Context, method string, url string, data interface{}, header http.Header) (*http.Request, error) {
 	body := req.makeBody(data)
-	targetReq, err := http.NewRequest(method, url, body)
+	targetReq, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
